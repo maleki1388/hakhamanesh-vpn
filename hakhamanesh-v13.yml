@@ -1,0 +1,707 @@
+name: Build Hakhamanesh VPN
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create project
+        run: |
+          flutter create --org com.hakhamanesh --project-name hakhamanesh_vpn app
+          cd app
+          flutter pub add flutter_v2ray http shared_preferences mobile_scanner
+
+      - name: Android config (name, permissions, minSdk)
+        run: |
+          cd app/android/app
+          sed -i 's/android:label="[^"]*"/android:label="Hakhamanesh VPN"/' src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application#' src/main/AndroidManifest.xml
+          sed -i '0,/^android {/s//android {\n    packaging { jniLibs { useLegacyPackaging = true } }/' build.gradle.kts build.gradle 2>/dev/null || true
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/' build.gradle* || true
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' build.gradle* || true
+
+      - name: Write app code
+        run: |
+          cat > app/lib/main.dart <<'EOF'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:flutter_v2ray/flutter_v2ray.dart';
+          import 'package:http/http.dart' as http;
+          import 'package:mobile_scanner/mobile_scanner.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          const bg = Color(0xFF050A18);
+          const card = Color(0xFF0D1730);
+          const neon = Color(0xFF00B4FF);
+          const green = Color(0xFF2DFF8A);
+
+          final langN = ValueNotifier<String>('fa');
+
+          const S = {
+            'en': {
+              'home': 'Home', 'servers': 'Servers', 'subs': 'Subscriptions', 'settings': 'Settings',
+              'connected': 'Connected', 'connecting': 'Connecting...', 'disconnected': 'Disconnected',
+              'ping': 'Ping', 'time': 'Time', 'down': 'Download', 'up': 'Upload',
+              'noconf': 'No server yet. Add a subscription.', 'hint': 'Paste subscription link or config',
+              'paste': 'Paste', 'scan': 'Scan QR', 'update': 'Update all', 'testall': 'Test ping',
+              'lang': 'Language', 'auto': 'Auto-update on launch', 'copy': 'Copy', 'delete': 'Delete',
+              'unsupported': 'Unsupported or empty link', 'denied': 'VPN permission denied',
+              'configs': 'configs', 'about': 'Hakhamanesh VPN  v1.0', 'sorted': 'Sorted by real ping',
+              'nosub': 'No subscriptions yet', 'copied': 'Copied', 'fetcherr': 'Subscription error',
+            },
+            'fa': {
+              'home': 'خانه', 'servers': 'سرورها', 'subs': 'اشتراک‌ها', 'settings': 'تنظیمات',
+              'connected': 'متصل شد', 'connecting': 'در حال اتصال...', 'disconnected': 'قطع',
+              'ping': 'پینگ', 'time': 'زمان', 'down': 'دانلود', 'up': 'آپلود',
+              'noconf': 'هنوز سروری نیست. یک اشتراک اضافه کن.', 'hint': 'لینک ساب یا کانفیگ رو بچسبون',
+              'paste': 'چسباندن', 'scan': 'اسکن QR', 'update': 'به‌روزرسانی همه', 'testall': 'تست پینگ',
+              'lang': 'زبان', 'auto': 'آپدیت خودکار هنگام باز شدن', 'copy': 'کپی', 'delete': 'حذف',
+              'unsupported': 'لینک پشتیبانی نمی‌شود یا خالیه', 'denied': 'دسترسی VPN داده نشد',
+              'configs': 'کانفیگ', 'about': 'Hakhamanesh VPN  v1.0', 'sorted': 'مرتب‌شده بر اساس پینگ واقعی',
+              'nosub': 'هنوز اشتراکی نیست', 'copied': 'کپی شد', 'fetcherr': 'خطا در دریافت ساب',
+            },
+          };
+
+          String t(String k) => S[langN.value]![k] ?? k;
+
+          bool isConfig(String s) =>
+              s.startsWith('vmess://') ||
+              s.startsWith('vless://') ||
+              s.startsWith('trojan://') ||
+              s.startsWith('ss://') ||
+              s.startsWith('socks://');
+
+          String fmt(int b) {
+            if (b < 1024) return '$b B/s';
+            if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)} KB/s';
+            return '${(b / 1024 / 1024).toStringAsFixed(2)} MB/s';
+          }
+
+          class Sub {
+            String url;
+            List<String> links;
+            Sub(this.url, this.links);
+            Map<String, dynamic> toJson() => {'u': url, 'l': links};
+            static Sub from(Map m) => Sub(m['u'] as String, List<String>.from(m['l'] as List));
+          }
+
+          class Cfg {
+            final String link, name, group;
+            int ping;
+            Cfg(this.link, this.name, this.group, this.ping);
+          }
+
+          void main() => runApp(const App());
+
+          class App extends StatelessWidget {
+            const App({super.key});
+            @override
+            Widget build(BuildContext context) => ValueListenableBuilder<String>(
+                  valueListenable: langN,
+                  builder: (context, lang, _) => MaterialApp(
+                    title: 'Hakhamanesh VPN',
+                    debugShowCheckedModeBanner: false,
+                    theme: ThemeData.dark(useMaterial3: true).copyWith(
+                      scaffoldBackgroundColor: bg,
+                      colorScheme: const ColorScheme.dark(primary: neon),
+                      appBarTheme: const AppBarTheme(backgroundColor: bg),
+                      navigationBarTheme: const NavigationBarThemeData(
+                          backgroundColor: card, indicatorColor: Color(0x3300B4FF)),
+                    ),
+                    builder: (c, child) => Directionality(
+                      textDirection: lang == 'fa' ? TextDirection.rtl : TextDirection.ltr,
+                      child: child!,
+                    ),
+                    home: const Home(),
+                  ),
+                );
+          }
+
+          class QrPage extends StatefulWidget {
+            const QrPage({super.key});
+            @override
+            State<QrPage> createState() => _QrState();
+          }
+
+          class _QrState extends State<QrPage> {
+            bool done = false;
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(title: Text(t('scan'))),
+                  body: MobileScanner(onDetect: (cap) {
+                    if (done) return;
+                    for (final b in cap.barcodes) {
+                      final v = b.rawValue;
+                      if (v != null && v.isNotEmpty) {
+                        done = true;
+                        Navigator.pop(context, v);
+                        break;
+                      }
+                    }
+                  }),
+                );
+          }
+
+          class Home extends StatefulWidget {
+            const Home({super.key});
+            @override
+            State<Home> createState() => _HomeState();
+          }
+
+          class _HomeState extends State<Home> {
+            late final FlutterV2ray v2;
+            V2RayStatus? st;
+            List<Sub> subs = [];
+            List<String> singles = [];
+            List<Cfg> cfgs = [];
+            final Map<String, int> pings = {};
+            String? sel;
+            bool busy = false, auto = true, pinging = false;
+            int tab = 0, cping = -1;
+            Timer? timer;
+            String lastState = 'DISCONNECTED';
+            final ctl = TextEditingController();
+
+            String get state => st?.state ?? 'DISCONNECTED';
+
+            @override
+            void initState() {
+              super.initState();
+              langN.addListener(_lang);
+              v2 = FlutterV2ray(onStatusChanged: (s) {
+                if (!mounted) return;
+                setState(() => st = s);
+                if (s.state == 'CONNECTED' && lastState != 'CONNECTED') measure();
+                if (s.state != 'CONNECTED') cping = -1;
+                lastState = s.state;
+              });
+              timer = Timer.periodic(const Duration(minutes: 1), (_) {
+                if (state == 'CONNECTED') measure();
+              });
+              init();
+            }
+
+            void _lang() {
+              if (mounted) setState(() {});
+            }
+
+            @override
+            void dispose() {
+              langN.removeListener(_lang);
+              timer?.cancel();
+              super.dispose();
+            }
+
+            void toast(String m) {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+            }
+
+            Future<void> measure() async {
+              try {
+                final d = await v2.getConnectedServerDelay().timeout(const Duration(seconds: 10));
+                if (mounted) setState(() => cping = d);
+              } catch (_) {}
+            }
+
+            Future<void> init() async {
+              final p = await SharedPreferences.getInstance();
+              langN.value = p.getString('lang') ?? 'fa';
+              auto = p.getBool('auto') ?? true;
+              singles = p.getStringList('singles') ?? [];
+              sel = p.getString('sel');
+              try {
+                subs = (jsonDecode(p.getString('subs') ?? '[]') as List)
+                    .map((e) => Sub.from(e as Map))
+                    .toList();
+              } catch (_) {}
+              rebuild();
+              if (mounted) setState(() {});
+              try {
+                await v2.initializeV2Ray();
+              } catch (e) {
+                toast('$e');
+              }
+              if (auto && (subs.isNotEmpty)) {
+                await refresh();
+              } else {
+                await pingAll();
+              }
+            }
+
+            Future<void> save() async {
+              final p = await SharedPreferences.getInstance();
+              await p.setString('subs', jsonEncode(subs.map((e) => e.toJson()).toList()));
+              await p.setStringList('singles', singles);
+              await p.setBool('auto', auto);
+              await p.setString('lang', langN.value);
+              if (sel != null) await p.setString('sel', sel!);
+            }
+
+            void rebuild() {
+              final out = <Cfg>[];
+              final seen = <String>{};
+              void addAll(List<String> ls, String g) {
+                for (final l in ls) {
+                  if (!seen.add(l)) continue;
+                  try {
+                    final u = FlutterV2ray.parseFromURL(l);
+                    out.add(Cfg(l, u.remark.isEmpty ? 'Server' : u.remark, g, pings[l] ?? -1));
+                  } catch (_) {}
+                }
+              }
+
+              addAll(singles, '');
+              for (final s in subs) {
+                addAll(s.links, Uri.tryParse(s.url)?.host ?? s.url);
+              }
+              cfgs = out;
+              sortCfgs();
+            }
+
+            void sortCfgs() {
+              cfgs.sort((a, b) {
+                if (a.ping <= 0 && b.ping <= 0) return 0;
+                if (a.ping <= 0) return 1;
+                if (b.ping <= 0) return -1;
+                return a.ping.compareTo(b.ping);
+              });
+            }
+
+            Cfg? get cur {
+              if (cfgs.isEmpty) return null;
+              for (final c in cfgs) {
+                if (c.link == sel) return c;
+              }
+              return cfgs.first;
+            }
+
+            Future<List<String>> fetchSub(String url) async {
+              final r = await http
+                  .get(Uri.parse(url), headers: {'User-Agent': 'v2rayNG/1.8.29'})
+                  .timeout(const Duration(seconds: 25));
+              if (r.statusCode != 200) throw 'HTTP ${r.statusCode}';
+              var body = utf8.decode(r.bodyBytes, allowMalformed: true).trim();
+              if (!body.contains('://')) {
+                var b = body
+                    .replaceAll(RegExp(r'\s'), '')
+                    .replaceAll('-', '+')
+                    .replaceAll('_', '/');
+                while (b.length % 4 != 0) {
+                  b += '=';
+                }
+                body = utf8.decode(base64.decode(b), allowMalformed: true);
+              }
+              return body
+                  .split(RegExp(r'[\r\n]+'))
+                  .map((e) => e.trim())
+                  .where(isConfig)
+                  .toList();
+            }
+
+            Future<void> refresh() async {
+              if (busy) return;
+              setState(() => busy = true);
+              for (final s in subs) {
+                try {
+                  final l = await fetchSub(s.url);
+                  if (l.isNotEmpty) s.links = l;
+                } catch (e) {
+                  toast('${t('fetcherr')}: $e');
+                }
+              }
+              rebuild();
+              await save();
+              if (mounted) setState(() => busy = false);
+              await pingAll();
+            }
+
+            Future<void> pingAll() async {
+              if (pinging || cfgs.isEmpty) return;
+              if (mounted) setState(() => pinging = true);
+              final list = List<Cfg>.from(cfgs);
+              for (var i = 0; i < list.length; i += 5) {
+                await Future.wait(list.skip(i).take(5).map((c) async {
+                  try {
+                    final u = FlutterV2ray.parseFromURL(c.link);
+                    c.ping = await v2
+                        .getServerDelay(config: u.getFullConfiguration())
+                        .timeout(const Duration(seconds: 8));
+                  } catch (_) {
+                    c.ping = -1;
+                  }
+                  pings[c.link] = c.ping;
+                }));
+                if (mounted) setState(() {});
+              }
+              sortCfgs();
+              if (mounted) setState(() => pinging = false);
+            }
+
+            Future<void> add(String text, {bool clear = false}) async {
+              final lines = text
+                  .split(RegExp(r'[\r\n\s]+'))
+                  .map((e) => e.trim())
+                  .where((e) => e.isNotEmpty)
+                  .toList();
+              var ok = false;
+              for (final l in lines) {
+                if (l.startsWith('http://') || l.startsWith('https://')) {
+                  if (!subs.any((s) => s.url == l)) subs.add(Sub(l, []));
+                  ok = true;
+                } else if (isConfig(l)) {
+                  if (!singles.contains(l)) singles.add(l);
+                  ok = true;
+                }
+              }
+              if (!ok) {
+                toast(t('unsupported'));
+                return;
+              }
+              if (clear) ctl.clear();
+              await save();
+              if (subs.any((s) => s.links.isEmpty)) {
+                await refresh();
+              } else {
+                rebuild();
+                if (mounted) setState(() {});
+                await pingAll();
+              }
+            }
+
+            void removeLink(String l) {
+              singles.remove(l);
+              for (final s in subs) {
+                s.links.remove(l);
+              }
+              pings.remove(l);
+              rebuild();
+              save();
+              setState(() {});
+            }
+
+            Future<void> toggle() async {
+              if (state == 'CONNECTED' || state == 'CONNECTING') {
+                await v2.stopV2Ray();
+                return;
+              }
+              final c = cur;
+              if (c == null) {
+                toast(t('noconf'));
+                return;
+              }
+              try {
+                if (await v2.requestPermission()) {
+                  final u = FlutterV2ray.parseFromURL(c.link);
+                  await v2.startV2Ray(
+                    remark: u.remark,
+                    config: u.getFullConfiguration(),
+                    proxyOnly: false,
+                  );
+                } else {
+                  toast(t('denied'));
+                }
+              } catch (e) {
+                toast('$e');
+              }
+            }
+
+            Color pc(int p) => p <= 0 ? Colors.grey : (p < 250 ? green : (p < 600 ? Colors.orange : Colors.redAccent));
+
+            Widget stat(IconData i, String label, String v) => Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: card,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: neon.withOpacity(0.3)),
+                  ),
+                  child: Row(children: [
+                    Icon(i, color: neon),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                            Text(v,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                          ]),
+                    ),
+                  ]),
+                );
+
+            Widget homeTab() {
+              final on = state == 'CONNECTED';
+              final mid = state == 'CONNECTING';
+              final c = on ? green : (mid ? Colors.orange : neon);
+              final sc = cur;
+              return ListView(padding: const EdgeInsets.all(16), children: [
+                const Center(
+                    child: Text('HAKHAMANESH VPN',
+                        style: TextStyle(
+                            fontSize: 22, fontWeight: FontWeight.bold, letterSpacing: 2, color: neon))),
+                const SizedBox(height: 28),
+                Center(
+                  child: GestureDetector(
+                    onTap: toggle,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 300),
+                      width: 150,
+                      height: 150,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: card,
+                        border: Border.all(color: c, width: 3),
+                        boxShadow: [BoxShadow(color: c.withOpacity(0.55), blurRadius: on ? 40 : 18)],
+                      ),
+                      child: Icon(Icons.power_settings_new, size: 72, color: c),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Center(
+                    child: Text(on ? t('connected') : (mid ? t('connecting') : t('disconnected')),
+                        style: TextStyle(color: c, fontSize: 18))),
+                const SizedBox(height: 6),
+                Center(
+                    child: Text(sc == null ? t('noconf') : sc.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.grey))),
+                const SizedBox(height: 20),
+                GridView.count(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  crossAxisCount: 2,
+                  childAspectRatio: 2.2,
+                  crossAxisSpacing: 12,
+                  mainAxisSpacing: 12,
+                  children: [
+                    stat(Icons.network_ping, t('ping'), on && cping > 0 ? '$cping ms' : '—'),
+                    stat(Icons.timer_outlined, t('time'), on ? (st?.duration ?? '00:00:00') : '00:00:00'),
+                    stat(Icons.arrow_downward, t('down'), on ? fmt(st?.downloadSpeed ?? 0) : '—'),
+                    stat(Icons.arrow_upward, t('up'), on ? fmt(st?.uploadSpeed ?? 0) : '—'),
+                  ],
+                ),
+              ]);
+            }
+
+            Widget serversTab() => Column(children: [
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Row(children: [
+                      Expanded(
+                          child: Text('${cfgs.length} ${t('configs')} • ${t('sorted')}',
+                              style: const TextStyle(color: Colors.grey, fontSize: 12))),
+                      TextButton.icon(
+                          onPressed: pinging ? null : pingAll,
+                          icon: pinging
+                              ? const SizedBox(
+                                  width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Icon(Icons.speed),
+                          label: Text(t('testall'))),
+                    ]),
+                  ),
+                  Expanded(
+                    child: cfgs.isEmpty
+                        ? Center(child: Text(t('noconf')))
+                        : ListView.builder(
+                            itemCount: cfgs.length,
+                            itemBuilder: (_, i) {
+                              final c = cfgs[i];
+                              final s = cur?.link == c.link;
+                              return Container(
+                                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: card,
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(color: s ? neon : Colors.transparent, width: 1.5),
+                                ),
+                                child: ListTile(
+                                  title: Text(c.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                  subtitle: c.group.isEmpty ? null : Text(c.group),
+                                  trailing: Text(c.ping > 0 ? '${c.ping} ms' : '—',
+                                      style: TextStyle(color: pc(c.ping), fontWeight: FontWeight.bold)),
+                                  onTap: () {
+                                    setState(() => sel = c.link);
+                                    save();
+                                  },
+                                  onLongPress: () => showModalBottomSheet(
+                                    context: context,
+                                    backgroundColor: card,
+                                    builder: (_) => SafeArea(
+                                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                                        ListTile(
+                                          leading: const Icon(Icons.copy),
+                                          title: Text(t('copy')),
+                                          onTap: () {
+                                            Clipboard.setData(ClipboardData(text: c.link));
+                                            Navigator.pop(context);
+                                            toast(t('copied'));
+                                          },
+                                        ),
+                                        ListTile(
+                                          leading: const Icon(Icons.delete, color: Colors.redAccent),
+                                          title: Text(t('delete')),
+                                          onTap: () {
+                                            Navigator.pop(context);
+                                            removeLink(c.link);
+                                          },
+                                        ),
+                                      ]),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ]);
+
+            Widget subsTab() => ListView(padding: const EdgeInsets.all(12), children: [
+                  TextField(
+                    controller: ctl,
+                    minLines: 1,
+                    maxLines: 4,
+                    decoration: InputDecoration(
+                      hintText: t('hint'),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+                      suffixIcon: IconButton(
+                          icon: const Icon(Icons.add_circle, color: neon),
+                          onPressed: () => add(ctl.text, clear: true)),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                          onPressed: () async {
+                            final d = await Clipboard.getData('text/plain');
+                            if (d?.text != null) await add(d!.text!);
+                          },
+                          icon: const Icon(Icons.paste),
+                          label: Text(t('paste'))),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                          onPressed: () async {
+                            final v = await Navigator.push<String>(
+                                context, MaterialPageRoute(builder: (_) => const QrPage()));
+                            if (v != null) await add(v);
+                          },
+                          icon: const Icon(Icons.qr_code_scanner),
+                          label: Text(t('scan'))),
+                    ),
+                  ]),
+                  const SizedBox(height: 8),
+                  FilledButton.icon(
+                      onPressed: busy ? null : refresh,
+                      icon: busy
+                          ? const SizedBox(
+                              width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Icon(Icons.refresh),
+                      label: Text(t('update'))),
+                  const SizedBox(height: 12),
+                  if (subs.isEmpty) Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(t('nosub')))),
+                  ...subs.map((s) => Container(
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(14)),
+                        child: ListTile(
+                          leading: const Icon(Icons.link, color: neon),
+                          title: Text(Uri.tryParse(s.url)?.host ?? s.url, maxLines: 1),
+                          subtitle: Text('${s.links.length} ${t('configs')}'),
+                          trailing: IconButton(
+                              icon: const Icon(Icons.delete, color: Colors.redAccent),
+                              onPressed: () {
+                                subs.remove(s);
+                                rebuild();
+                                save();
+                                setState(() {});
+                              }),
+                        ),
+                      )),
+                ]);
+
+            Widget settingsTab() => ListView(padding: const EdgeInsets.all(16), children: [
+                  Text(t('lang'), style: const TextStyle(color: Colors.grey)),
+                  const SizedBox(height: 8),
+                  SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(value: 'fa', label: Text('فارسی')),
+                      ButtonSegment(value: 'en', label: Text('English')),
+                    ],
+                    selected: {langN.value},
+                    onSelectionChanged: (v) {
+                      langN.value = v.first;
+                      save();
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(t('auto')),
+                    value: auto,
+                    onChanged: (v) {
+                      setState(() => auto = v);
+                      save();
+                    },
+                  ),
+                  const SizedBox(height: 24),
+                  Center(child: Text(t('about'), style: const TextStyle(color: Colors.grey))),
+                ]);
+
+            @override
+            Widget build(BuildContext context) {
+              final pages = [homeTab(), serversTab(), subsTab(), settingsTab()];
+              return Scaffold(
+                body: SafeArea(child: pages[tab]),
+                bottomNavigationBar: NavigationBar(
+                  selectedIndex: tab,
+                  onDestinationSelected: (i) => setState(() => tab = i),
+                  destinations: [
+                    NavigationDestination(icon: const Icon(Icons.home_rounded), label: t('home')),
+                    NavigationDestination(icon: const Icon(Icons.dns_rounded), label: t('servers')),
+                    NavigationDestination(icon: const Icon(Icons.link_rounded), label: t('subs')),
+                    NavigationDestination(icon: const Icon(Icons.settings_rounded), label: t('settings')),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Build APK
+        run: |
+          cd app
+          set +e
+          flutter build apk --release --no-shrink 2>&1 | tee ../build.log
+          code=${PIPESTATUS[0]}
+          if [ $code -ne 0 ]; then
+            echo "=========== ERROR SUMMARY ==========="
+            grep -n -B2 -A25 "What went wrong" ../build.log | head -80
+            grep -n -i "error:" ../build.log | head -30
+          fi
+          exit $code
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hakhamanesh-VPN
+          path: app/build/app/outputs/flutter-apk/app-release.apk
